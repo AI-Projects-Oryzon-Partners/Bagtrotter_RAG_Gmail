@@ -16,4 +16,4 @@ PyPDF2
 openpyxl
 pandas
 requests
-streamlit
+streamlit>=1.36
