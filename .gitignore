@@ -1,0 +1,70 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Installer logs
+pip-log.txt
+
+# Virtualenvs
+venv/
+ENV/
+env/
+.venv/
+venv.bak/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Unit test / coverage
+.pytest_cache/
+coverage.xml
+
+# Type checkers
+.mypy_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Secrets and credentials
+credentials.json
+token.json
+.env
+*.pem
+*.key
+
+# Local app files / caches
+last_checked.txt
+.streamlit/
+
+# Database / vector stores
+*.db
+*.sqlite
+qdrant_storage/
+vector_store/
+
+# Logs
+*.log
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Sphinx
+_build/
+
+# Environments
+.env/
