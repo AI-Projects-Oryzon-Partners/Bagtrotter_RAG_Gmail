@@ -15,5 +15,5 @@ PyPDF2
 openpyxl
 pandas
 requests
-streamlit>=1.18.0
+streamlit
 altair==4.2.2
