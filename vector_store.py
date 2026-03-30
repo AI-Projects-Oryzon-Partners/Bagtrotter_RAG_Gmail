@@ -51,7 +51,11 @@ from typing import Any
 import faiss
 import numpy as np
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct,
+    Filter, FieldCondition, MatchText,
+    PayloadSchemaType, TextIndexParams, TokenizerType,
+)
 
 from config import (
     QDRANT_URL, QDRANT_API_KEY,
@@ -82,6 +86,7 @@ def get_active_collection() -> str:
 # Qdrant connection (lazy singleton)
 # ---------------------------------------------------------------------------
 _qdrant_client: QdrantClient | None = None
+_indexes_ensured: set[str] = set()   # collections whose payload indexes are confirmed
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -92,6 +97,13 @@ def get_qdrant_client() -> QdrantClient:
         api_key = QDRANT_API_KEY if QDRANT_API_KEY else None
         _qdrant_client = QdrantClient(url=url, api_key=api_key, check_compatibility=False)
     return _qdrant_client
+
+
+def _ensure_indexes_once(collection_name: str) -> None:
+    """Call _ensure_payload_indexes at most once per collection per process."""
+    if collection_name not in _indexes_ensured:
+        _ensure_payload_indexes(collection_name)
+        _indexes_ensured.add(collection_name)
 
 
 def _ensure_collection(collection_name: str) -> None:
@@ -107,6 +119,41 @@ def _ensure_collection(collection_name: str) -> None:
                 distance=Distance.COSINE,
             ),
         )
+    _ensure_payload_indexes(collection_name)
+
+
+def _ensure_payload_indexes(collection_name: str) -> None:
+    """Create payload indexes for filtering and full-text search (idempotent)."""
+    client = get_qdrant_client()
+
+    # Keyword indexes for sender/recipient filtering
+    for field in ("sender_email", "recipient_email"):
+        try:
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field,
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+        except Exception:
+            pass
+
+    # Text indexes for full-text search on subject and body
+    text_schema = TextIndexParams(
+        type="text",
+        tokenizer=TokenizerType.WORD,
+        min_token_len=2,
+        max_token_len=30,
+        lowercase=True,
+    )
+    for field in ("subject", "body"):
+        try:
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field,
+                field_schema=text_schema,
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +175,21 @@ def embedding_to_list(emb: np.ndarray) -> list[float]:
 # Address extraction helper
 # ---------------------------------------------------------------------------
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}")
+
+
+# ---------------------------------------------------------------------------
+# Keyword helpers (for hybrid retrieval)
+# ---------------------------------------------------------------------------
+_STOPWORDS = frozenset({
+    # English
+    "the", "and", "for", "from", "that", "this", "with", "have", "was", "are",
+    "what", "which", "when", "where", "who", "how", "mail", "email", "gmail",
+    # French
+    "les", "des", "une", "est", "dans", "avec", "pour", "par", "sur", "pas",
+    "que", "qui", "quels", "sont", "deux", "quel", "quelle", "quelles",
+    "mais", "vous", "nous", "ils", "elles", "leur", "leurs", "aux", "ces",
+    "mes", "tes", "ses", "nos", "vos", "mon", "ton", "son", "une", "des",
+})
 
 
 def extract_email_address(full_addr: str) -> str:
@@ -221,12 +283,15 @@ def insert_email_record(
         pass
 
     # ---- Email-level embedding (subject + body + attachment text) ----
-    # Including attachment snippets means Qdrant's native search finds PDF content
-    # without any expensive scroll at query time.
+    # Subject is repeated to give it extra weight.
+    # Body includes up to 3000 chars to capture more structured content.
     att_text_for_embed = " ".join(
         (att.get("text_snippet") or "") for att in (attachments or [])
     )[:800]
-    email_embed_text = f"{subject or ''}\n{(body or '')[:1000]}\n{att_text_for_embed}".strip()
+    email_embed_text = (
+        f"{subject or ''}\n{subject or ''}\n"
+        f"{(body or '')[:3000]}\n{att_text_for_embed}"
+    ).strip()
     email_emb = get_embedding(email_embed_text)
 
     # ---- Chunk-level embeddings ----
@@ -311,24 +376,24 @@ def insert_email_record(
 # ---------------------------------------------------------------------------
 def vector_search_emails(query: str, k: int = 20, alpha: float = 0.6) -> list[dict]:
     """
-    Run vector search on email_embedding in Qdrant (which includes attachment text),
-    then re-rank the returned candidates using a combined score:
+    Run vector search on email_embedding in Qdrant, then re-rank candidates using
+    a combined score that includes body-chunk similarity (captures content beyond
+    the first 1000 chars used for the email-level embedding) and attachment chunks.
 
-        score_combined = alpha * score_body + (1 - alpha) * max(attachment_chunk_scores)
-
-    Attachment chunks are only scored for the top candidates returned by Qdrant,
-    so this is fast regardless of collection size.
+        score = alpha * max(body_emb_score, max_chunk_score) + (1-alpha) * max_att_score
     """
     client = get_qdrant_client()
     q_emb = get_embedding(query)
     q_flat = q_emb.flatten()          # shape (384,)
     q_list = q_flat.tolist()
 
-    # Single fast Qdrant query — email embedding already encodes attachment content
+    _ensure_indexes_once(_active_collection)
+
+    # Fetch a larger candidate pool so relevant emails aren't filtered out early
     response = client.query_points(
         collection_name=_active_collection,
         query=q_list,
-        limit=k * 2,
+        limit=k * 4,
         with_payload=True,
     )
 
@@ -337,7 +402,19 @@ def vector_search_emails(query: str, k: int = 20, alpha: float = 0.6) -> list[di
         doc = point.payload.copy()
         body_score = float(point.score)
 
-        # Score attachment chunks only for these top candidates (fast)
+        # Score body chunks — captures sections beyond the first 1000 chars
+        # that were excluded from the email-level embedding
+        max_chunk_score = 0.0
+        for chunk_doc in doc.get("chunks", []):
+            emb = chunk_doc.get("chunk_embedding")
+            if not emb:
+                continue
+            chunk_emb = np.array(emb, dtype=np.float32)
+            score = float(np.dot(q_flat, chunk_emb))
+            if score > max_chunk_score:
+                max_chunk_score = score
+
+        # Score attachment chunks
         max_att_score = 0.0
         best_att_snippet = ""
         best_att_filename = ""
@@ -353,10 +430,13 @@ def vector_search_emails(query: str, k: int = 20, alpha: float = 0.6) -> list[di
                 best_att_snippet = att_chunk.get("chunk_text", "")[:400]
                 best_att_filename = att_chunk.get("filename", "")
 
-        combined = alpha * body_score + (1.0 - alpha) * max_att_score
+        # Best content score: email embedding vs best body chunk
+        best_content_score = max(body_score, max_chunk_score)
+        combined = alpha * best_content_score + (1.0 - alpha) * max_att_score
 
         doc["score"]                    = combined
         doc["body_score"]               = body_score
+        doc["chunk_score"]              = max_chunk_score
         doc["attachment_score"]         = max_att_score
         doc["best_attachment_snippet"]  = best_att_snippet
         doc["best_attachment_filename"] = best_att_filename
@@ -364,6 +444,93 @@ def vector_search_emails(query: str, k: int = 20, alpha: float = 0.6) -> list[di
 
     docs.sort(key=lambda d: d["score"], reverse=True)
     return docs[:k]
+
+
+# ---------------------------------------------------------------------------
+# Keyword / full-text search (hybrid retrieval complement)
+# ---------------------------------------------------------------------------
+def _extract_keywords(text: str) -> list[str]:
+    """Return meaningful tokens from *text*, excluding stopwords."""
+    return [t for t in re.findall(r'\b\w{3,}\b', text.lower()) if t not in _STOPWORDS]
+
+
+def keyword_search_emails(query: str, k: int = 10) -> list[dict]:
+    """
+    Full-text keyword search: tries Qdrant's text-index filter first (fast path).
+    Falls back to Python-side scroll + substring match if the index is not ready.
+    Results are re-ranked by max body-chunk similarity to the query.
+    """
+    tokens = _extract_keywords(query)
+    if not tokens:
+        return []
+
+    qdrant = get_qdrant_client()
+    q_flat = get_embedding(query).flatten()
+
+    _ensure_indexes_once(_active_collection)
+
+    candidates: list[dict] = []
+
+    # Fast path: Qdrant text-index filter (requires payload index on subject/body)
+    try:
+        filter_conds = []
+        for token in tokens[:6]:
+            filter_conds.extend([
+                FieldCondition(key="subject", match=MatchText(text=token)),
+                FieldCondition(key="body",    match=MatchText(text=token)),
+            ])
+        results, _ = qdrant.scroll(
+            collection_name=_active_collection,
+            scroll_filter=Filter(should=filter_conds),
+            limit=50,
+            with_payload=True,
+        )
+        candidates = [point.payload for point in results]
+    except Exception:
+        # Index not yet available — scroll all docs and filter in Python
+        offset = None
+        while True:
+            batch, next_offset = qdrant.scroll(
+                collection_name=_active_collection,
+                limit=100,
+                offset=offset,
+                with_payload=True,
+            )
+            if not batch:
+                break
+            for point in batch:
+                doc = point.payload
+                haystack = (doc.get("subject", "") + " " + doc.get("body", "")).lower()
+                if any(t in haystack for t in tokens):
+                    candidates.append(doc)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+    # Re-rank candidates by max(body_emb_score, max_chunk_score)
+    scored: list[dict] = []
+    for doc in candidates:
+        body_emb_list = doc.get("email_embedding", [])
+        body_score = float(np.dot(q_flat, np.array(body_emb_list, dtype=np.float32))) if body_emb_list else 0.0
+
+        max_chunk_score = 0.0
+        for chunk_doc in doc.get("chunks", []):
+            emb = chunk_doc.get("chunk_embedding")
+            if not emb:
+                continue
+            score = float(np.dot(q_flat, np.array(emb, dtype=np.float32)))
+            if score > max_chunk_score:
+                max_chunk_score = score
+
+        combined = max(body_score, max_chunk_score)
+        out = dict(doc)
+        out["score"]       = combined
+        out["body_score"]  = body_score
+        out["chunk_score"] = max_chunk_score
+        scored.append(out)
+
+    scored.sort(key=lambda d: d["score"], reverse=True)
+    return scored[:k]
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +620,7 @@ def hybrid_search(
                 break
             offset = next_offset
 
-        # Filter by contact
+        # Filter by contact — first try sender/recipient fields (exact match)
         candidates = []
         for doc in all_docs:
             sender_email = doc.get("sender_email", "").lower()
@@ -467,7 +634,19 @@ def hybrid_search(
                 contact_lower in recipient):
                 candidates.append(doc)
 
-        # Re-rank by combined score (body + attachments)
+        # Fallback: if no sender/recipient match, search inside the email body.
+        # This handles forwarded emails where the contact's name only appears
+        # in the body thread (e.g. "Fwd:" emails forwarded by a third party).
+        if not candidates:
+            for doc in all_docs:
+                body = doc.get("body", "").lower()
+                chunks_text = " ".join(
+                    c.get("chunk_text", "") for c in doc.get("chunks", [])
+                ).lower()
+                if contact_lower in body or contact_lower in chunks_text:
+                    candidates.append(doc)
+
+        # Re-rank by combined score (body emb + body chunks + attachments)
         q_emb_np = get_embedding(query)
         q_flat = q_emb_np.flatten()
         scored: list[tuple[float, dict]] = []
@@ -475,6 +654,16 @@ def hybrid_search(
         for doc in candidates:
             body_emb = np.array(doc.get("email_embedding", []), dtype=np.float32).flatten()
             body_score = float(np.dot(q_flat, body_emb)) if body_emb.shape[0] > 0 else 0.0
+
+            # Score body chunks to capture content beyond first 1000 chars
+            max_chunk_score = 0.0
+            for chunk_doc in doc.get("chunks", []):
+                emb = chunk_doc.get("chunk_embedding")
+                if not emb:
+                    continue
+                score = float(np.dot(q_flat, np.array(emb, dtype=np.float32)))
+                if score > max_chunk_score:
+                    max_chunk_score = score
 
             max_att_score = 0.0
             best_att_snippet = ""
@@ -490,11 +679,13 @@ def hybrid_search(
                     best_att_snippet = att_chunk.get("chunk_text", "")[:400]
                     best_att_filename = att_chunk.get("filename", "")
 
-            combined = alpha * body_score + (1.0 - alpha) * max_att_score
-            doc["score"] = combined
-            doc["body_score"] = body_score
-            doc["attachment_score"] = max_att_score
-            doc["best_attachment_snippet"] = best_att_snippet
+            best_content_score = max(body_score, max_chunk_score)
+            combined = alpha * best_content_score + (1.0 - alpha) * max_att_score
+            doc["score"]                    = combined
+            doc["body_score"]               = body_score
+            doc["chunk_score"]              = max_chunk_score
+            doc["attachment_score"]         = max_att_score
+            doc["best_attachment_snippet"]  = best_att_snippet
             doc["best_attachment_filename"] = best_att_filename
             scored.append((combined, doc))
 

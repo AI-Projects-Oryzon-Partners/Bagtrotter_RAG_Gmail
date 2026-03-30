@@ -130,7 +130,15 @@ if prompt := st.chat_input(f"Posez votre question sur {CLIENT_DISPLAY_NAME}...")
                 rag_messages, reply = ask_question(prompt, messages=st.session_state.rag_messages)
                 st.session_state.rag_messages = rag_messages
             except Exception as e:
-                reply = f"Erreur : {e}"
+                print(f"(APP): Exception during ask_question: {e}")
+                err_lower = str(e).lower()
+                if any(k in err_lower for k in ("ssl", "handshake", "timed out", "timeout", "connection")):
+                    reply = (
+                        "La connexion au service IA a expiré. "
+                        "Veuillez reessayer votre question dans quelques instants."
+                    )
+                else:
+                    reply = f"Erreur : {e}"
         st.markdown(reply)
 
     st.session_state.messages_display.append({"role": "assistant", "content": reply})

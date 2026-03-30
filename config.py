@@ -37,12 +37,12 @@ sys.stderr = _old_stderr
 # Parameters
 # ---------------------------------------------------------------------------
 EMBEDDING_DIM = 384
-K = 20                    # Number of emails to retrieve (vector search candidates)
-CHUNK_SIZE = 800          # Characters per chunk
-CHUNK_OVERLAP = 200       # Overlap between consecutive chunks
-MAX_CONTEXT_TOKENS = 5500
-MAX_EMAIL_BODY_CHARS = 1500
-
+K = 6                    # Number of emails to retrieve (vector search candidates)
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 250     
+MAX_CONTEXT_TOKENS = 16000
+MAX_EMAIL_BODY_CHARS = 12000
+MISTRAL_TIMEOUT_MS = int(os.getenv("MISTRAL_TIMEOUT_MS", "120000"))
 # ---------------------------------------------------------------------------
 # Qdrant configuration
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ mistral_api_key = os.getenv("MISTRAL_API_KEY")
 if not mistral_api_key:
     raise ValueError("MISTRAL_API_KEY environment variable is not set")
 
-client = Mistral(api_key=mistral_api_key)
+client = Mistral(api_key=mistral_api_key, timeout_ms=MISTRAL_TIMEOUT_MS)
 
 # ---------------------------------------------------------------------------
 # Embeddings model
