@@ -49,7 +49,7 @@ with st.sidebar:
         "</span></div>",
         unsafe_allow_html=True,
     )
-    st.divider()
+    st.markdown("---")
 
     st.subheader("Client actif")
     st.markdown(
@@ -60,7 +60,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    st.divider()
+    st.markdown("---")
 
     st.subheader("Synchronisation Gmail")
     if st.button("Actualiser les e-mails", use_container_width=True, type="primary",
@@ -86,7 +86,7 @@ with st.sidebar:
         with st.expander("Journal de synchronisation", expanded=False):
             st.code(st.session_state.sync_log, language="")
 
-    st.divider()
+    st.markdown("---")
 
     st.subheader("Conversation")
     if st.button("Nouvelle conversation", use_container_width=True):
@@ -94,7 +94,7 @@ with st.sidebar:
         st.session_state.rag_messages = None
         st.rerun()
 
-    st.divider()
+    st.markdown("---")
     st.caption("2026 Oryzon Partners - Confidentiel")
     st.caption("Moteur : Mistral - Qdrant - Gmail API")
 
@@ -107,7 +107,7 @@ with col_title:
 with col_badge:
     st.metric(label="Client actif", value=CLIENT_DISPLAY_NAME)
 
-st.divider()
+st.markdown("---")
 
 if not st.session_state.messages_display:
     st.info(
